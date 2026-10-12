@@ -28,6 +28,7 @@ With no directory argument, `viewr` views the current directory.
 | `Home` / `End` | First / last image |
 | `+` / `=` , `-` | Zoom in / out; out stops at fit (drag to pan while zoomed) |
 | Pinch / spread (trackpad) | Zoom out / in toward the pointer; springs back past fit |
+| Two-finger scroll (trackpad) | Pan (`Cmd`-scroll zooms instead) |
 | `0` | Fit to window |
 | `1` | Actual size (100%) |
 | `F` | Toggle fullscreen |

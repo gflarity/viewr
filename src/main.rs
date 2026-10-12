@@ -359,6 +359,16 @@ impl Viewer {
         self.springing || self.zoom < min_zoom
     }
 
+    /// This frame's two-finger scroll, if any: pan with the content following the delta.
+    fn poll_scroll(&mut self, ctx: &egui::Context, img_size: egui::Vec2) {
+        let delta = ctx.input(|i| i.smooth_scroll_delta());
+        if delta != egui::Vec2::ZERO {
+            self.spring_v = 0.0;
+            self.springing = false;
+            self.apply_pan(delta, img_size);
+        }
+    }
+
     /// Ease an overshot zoom back to the minimum with a slight bounce past it. Returns true once settled.
     fn spring_back(&mut self, min_zoom: f32) -> bool {
         self.spring_v += (min_zoom - self.zoom) * 0.25;
@@ -403,6 +413,11 @@ impl Viewer {
     }
 }
 
+/// Full-viewport panel: pure black, no margins, so a fitted image touches the window edges.
+fn panel_frame() -> egui::Frame {
+    egui::Frame::new().inner_margin(0).fill(egui::Color32::BLACK)
+}
+
 fn fire_hook(prog: &str, file: &std::path::Path, key: &str) {
     let _ = std::process::Command::new(prog)
         .arg(file)
@@ -424,7 +439,7 @@ impl eframe::App for Viewer {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ui, |ui| {
+        egui::CentralPanel::default().frame(panel_frame()).show(ui, |ui| {
             if self.files.is_empty() {
                 ui.centered_and_justified(|ui| ui.label(format!("No supported images in {}", self.dir.display())));
                 return;
@@ -456,6 +471,7 @@ impl eframe::App for Viewer {
                     if resp.dragged() {
                         self.apply_pan(resp.drag_delta(), size);
                     }
+                    self.poll_scroll(ui.ctx(), size);
                     let rect = egui::Rect::from_center_size(rect.center() + self.offset, size);
                     ui.put(rect, egui::Image::new(&tex).fit_to_exact_size(size));
                 }
@@ -829,5 +845,71 @@ mod state_tests {
         assert!((v.zoom - 1.0).abs() < 1e-3, "zoom = {}", v.zoom);
         assert!(v.offset.length() < 0.5, "offset = {:?}", v.offset);
         assert!(t.elapsed() < std::time::Duration::from_secs(5), "60 gesture frames took {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn two_finger_scroll_pans_with_content_delta() {
+        let (_dir, files) = fixture_dir("scroll", &[(200, 100)]);
+        let mut v = Viewer::new(files, PathBuf::from("."), None);
+        let ctx = egui::Context::default();
+        let img = egui::vec2(2000.0, 2000.0); // generous clamp bounds
+        let wheel = |phase: egui::TouchPhase, delta: egui::Vec2| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta,
+            phase,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let frame = |v: &mut Viewer, events: Vec<egui::Event>| {
+            let input = egui::RawInput { events, ..Default::default() };
+            ctx.run_ui(input, |ui| v.poll_scroll(ui.ctx(), img)).textures_delta.clear();
+        };
+        // a trackpad scroll gesture: begin, moves, end
+        frame(&mut v, vec![wheel(egui::TouchPhase::Start, egui::Vec2::ZERO)]);
+        assert_eq!(v.offset, egui::Vec2::ZERO);
+        frame(&mut v, vec![wheel(egui::TouchPhase::Move, egui::vec2(30.0, -40.0))]);
+        assert_eq!(v.offset, egui::vec2(30.0, -40.0));
+        frame(&mut v, vec![wheel(egui::TouchPhase::Move, egui::vec2(10.0, 10.0))]);
+        assert_eq!(v.offset, egui::vec2(40.0, -30.0));
+        frame(&mut v, vec![wheel(egui::TouchPhase::End, egui::Vec2::ZERO)]);
+        assert_eq!(v.offset, egui::vec2(40.0, -30.0));
+        // scrolling wins over an in-flight bounce
+        v.zoom = 0.8;
+        v.springing = true;
+        v.spring_v = 0.5;
+        frame(&mut v, vec![wheel(egui::TouchPhase::Move, egui::vec2(5.0, 0.0))]);
+        assert!(!v.springing);
+        assert_eq!(v.spring_v, 0.0);
+        assert_eq!(v.offset, egui::vec2(45.0, -30.0));
+    }
+
+    #[test]
+    fn command_scroll_zooms_instead_of_panning() {
+        let (_dir, files) = fixture_dir("scroll-zoom", &[(200, 100)]);
+        let mut v = Viewer::new(files, PathBuf::from("."), None);
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            events: vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, 4.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::COMMAND,
+            }],
+            ..Default::default()
+        };
+        ctx.run_ui(input, |ui| {
+            v.poll_scroll(ui.ctx(), egui::vec2(2000.0, 2000.0));
+            v.poll_pinch(ui.ctx(), egui::vec2(200.0, 100.0), egui::pos2(500.0, 375.0), 1.0);
+        })
+        .textures_delta
+        .clear();
+        assert_eq!(v.offset, egui::Vec2::ZERO, "zoom scrolling must not pan");
+        assert!(v.zoom > 1.0, "zoom = {}", v.zoom);
+    }
+
+    #[test]
+    fn panel_is_full_bleed_pure_black() {
+        let f = panel_frame();
+        assert_eq!(f.fill, egui::Color32::BLACK);
+        assert_eq!(f.inner_margin, egui::Margin::ZERO);
     }
 }
