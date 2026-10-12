@@ -24,7 +24,7 @@ With no directory argument, `viewr` views the current directory.
 
 | Key | Action |
 |---|---|
-| `←` / `→` (or `H` / `L`) | Previous / next image (wraps around) |
+| `←` / `→` (or `H` / `L`) | Previous / next image (stops at each end) |
 | `Home` / `End` | First / last image |
 | `+` / `=` , `-` | Zoom in / out; out stops at fit (drag to pan while zoomed) |
 | Pinch / spread (trackpad) | Zoom out / in toward the pointer; springs back past fit |

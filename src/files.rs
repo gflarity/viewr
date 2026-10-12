@@ -27,15 +27,6 @@ pub fn collect(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Circular distance between two indices in a list of length `n`.
-pub fn circular_distance(a: usize, b: usize, n: usize) -> usize {
-    if n == 0 {
-        return 0;
-    }
-    let d = a.abs_diff(b);
-    d.min(n - d)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,13 +61,5 @@ mod tests {
     #[test]
     fn collect_missing_dir_errors() {
         assert!(collect(Path::new("/no/such/dir/viewr-test-12345")).is_err());
-    }
-
-    #[test]
-    fn circular_distance_wraps() {
-        assert_eq!(circular_distance(0, 9, 10), 1);
-        assert_eq!(circular_distance(0, 5, 10), 5);
-        assert_eq!(circular_distance(3, 3, 10), 0);
-        assert_eq!(circular_distance(0, 0, 0), 0);
     }
 }

@@ -161,8 +161,13 @@ impl Viewer {
         if n == 0 {
             return;
         }
-        let mut idx = vec![self.index, (self.index + 1) % n, (self.index + n - 1) % n];
-        idx.dedup();
+        let mut idx = vec![self.index];
+        if self.index + 1 < n {
+            idx.push(self.index + 1);
+        }
+        if self.index > 0 {
+            idx.push(self.index - 1);
+        }
         idx.retain(|i| !matches!(self.cache.get(i), Some(Slot::Ready { .. }) | Some(Slot::Failed(_))));
         for i in &idx {
             self.cache.entry(*i).or_insert(Slot::Loading);
@@ -182,8 +187,8 @@ impl Viewer {
         self.spring_v = 0.0;
         self.still_frames = 0;
         self.springing = false;
-        let (at, n) = (self.index, self.files.len());
-        self.cache.retain(|i, _| files::circular_distance(*i, at, n) <= 1);
+        let at = self.index;
+        self.cache.retain(|i, _| i.abs_diff(at) <= 1);
         self.request_around();
     }
 
@@ -192,7 +197,7 @@ impl Viewer {
         if n == 0 {
             return;
         }
-        self.goto((self.index as isize + delta).rem_euclid(n as isize) as usize);
+        self.goto((self.index as isize + delta).clamp(0, n as isize - 1) as usize);
     }
 
     fn set_fullscreen(&mut self, on: bool, ctx: &egui::Context) {
@@ -567,31 +572,45 @@ mod state_tests {
     }
 
     #[test]
-    fn arrows_hl_home_end_navigate_and_wrap() {
+    fn arrows_hl_home_end_navigate_and_stop_at_ends() {
         let (_dir, files) = fixture_dir("nav", &[(8, 8), (8, 8), (8, 8)]);
         let mut v = Viewer::new(files, PathBuf::from("."), None);
+        assert_eq!(v.index, 0);
+        press(&mut v, "ArrowLeft");
+        assert_eq!(v.index, 0, "stops at the first image");
+        press(&mut v, "h");
         assert_eq!(v.index, 0);
         press(&mut v, "ArrowRight");
         assert_eq!(v.index, 1);
         press(&mut v, "l");
         assert_eq!(v.index, 2);
         press(&mut v, "ArrowRight");
-        assert_eq!(v.index, 0, "wraps forward");
+        assert_eq!(v.index, 2, "stops at the last image");
+        press(&mut v, "l");
+        assert_eq!(v.index, 2);
         press(&mut v, "ArrowLeft");
-        assert_eq!(v.index, 2, "wraps back");
-        press(&mut v, "h");
         assert_eq!(v.index, 1);
+        press(&mut v, "h");
+        assert_eq!(v.index, 0);
         press(&mut v, "Home");
         assert_eq!(v.index, 0);
         press(&mut v, "End");
         assert_eq!(v.index, 2);
-        // navigating resets zoom and pan
+        // navigating resets zoom and pan ...
         v.zoom = 3.0;
         v.offset = egui::vec2(10.0, 10.0);
         press(&mut v, "ArrowLeft");
         assert_eq!(v.index, 1);
         assert_eq!(v.zoom, 1.0);
         assert_eq!(v.offset, egui::Vec2::ZERO);
+        // ... but pushing against an end is a no-op that leaves them alone
+        press(&mut v, "End");
+        v.zoom = 3.0;
+        v.offset = egui::vec2(10.0, 10.0);
+        press(&mut v, "ArrowRight");
+        assert_eq!(v.index, 2);
+        assert_eq!(v.zoom, 3.0);
+        assert_eq!(v.offset, egui::vec2(10.0, 10.0));
     }
 
     #[test]
