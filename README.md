@@ -18,7 +18,32 @@ cargo install --path .
 viewr ~/Pictures/shoot
 ```
 
-With no directory argument, `viewr` views the current directory.
+With no argument, `viewr` views the current directory. Given a single image
+file instead of a directory, it views that image with the rest of its
+directory alongside:
+
+```sh
+viewr ~/Pictures/shoot/DSC_0001.NEF
+```
+
+## macOS app bundle (Finder)
+
+To open images by double-clicking them in Finder, build the app bundle:
+
+```sh
+scripts/make-app.sh            # builds dist/Viewr.app
+scripts/make-app.sh --install  # also copies it to /Applications
+```
+
+The bundle registers `viewr` as a viewer for JPEG (`.jpg`/`.jpeg`), PNG
+(`.png`), and Nikon NEF (`.nef`) files. It is registered as an alternate
+handler, so it appears under right-click → Open With without replacing your
+current default app. To make it the default for a file type, select a file in
+Finder → Get Info → Open with: viewr → Change All…
+
+Opening a file from Finder shows that image with its folder's images
+alongside; opening another file while `viewr` is already running moves the
+existing window to the new image.
 
 ## Keys
 

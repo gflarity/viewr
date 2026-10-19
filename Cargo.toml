@@ -16,8 +16,15 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 
+# Finder open-events (application:openURLs:) are added to winit's delegate class
+# at runtime; objc2 is the same copy winit itself links.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+
 [lints.rust]
-unsafe_code = "forbid"
+# deny (not forbid) so src/macos.rs — the Finder/Open-With glue — can opt in
+# locally with #[allow(unsafe_code)]; unsafe stays an error everywhere else.
+unsafe_code = "deny"
 
 [lints.clippy]
 dbg_macro = "warn"

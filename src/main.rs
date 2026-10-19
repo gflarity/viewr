@@ -1,8 +1,12 @@
-//! viewr: a minimalist native image viewer. `viewr [DIR]` shows the JPEG/PNG/NEF images
-//! in a directory; flip through them with the arrow keys.
+//! viewr: a minimalist native image viewer. `viewr [DIR|FILE]` shows the JPEG/PNG/NEF images
+//! in a directory; flip through them with the arrow keys. Given a FILE, it shows that
+//! image with its siblings alongside. On macOS, files opened from Finder (double-click /
+//! Open With) arrive via `application:openURLs:` — see `macos`.
 
 mod files;
 mod loader;
+#[cfg(target_os = "macos")]
+mod macos;
 mod nef;
 mod orient;
 // Vendored TIFF reader (see ATTRIBUTION.md): only the preview-extraction subset is used.
@@ -27,24 +31,69 @@ fn main() -> eframe::Result<()> {
             std::process::exit(2);
         }
     };
-    let files = match files::collect(&args.dir) {
+    // A single image file means "view this one, with its folder alongside"; anything
+    // else is treated as the directory to view (and collect() reports it if missing).
+    let (dir, start_file) = match split_target(&args.path) {
+        Target::File(file) => {
+            let dir = file.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+            (dir, Some(file))
+        }
+        Target::Dir(dir) => (dir, None),
+    };
+    let files = match files::collect(&dir) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("viewr: {}: {e}", args.dir.display());
+            eprintln!("viewr: {}: {e}", dir.display());
             std::process::exit(1);
         }
     };
-    let viewer = Viewer::new(files, args.dir, args.on_key);
+    let start = match &start_file {
+        Some(file) => match files::index_of(&files, file) {
+            Some(i) => i,
+            None => {
+                eprintln!("viewr: {}: not a supported image (jpg, jpeg, png, nef)", file.display());
+                std::process::exit(1);
+            }
+        },
+        None => 0,
+    };
+    let mut viewer = Viewer::new(files, dir, args.on_key);
+    viewer.goto(start);
+    // Finder may deliver a file before the app finishes launching; the handler
+    // for that must be registered before eframe's event loop starts (see macos).
+    #[cfg(target_os = "macos")]
+    macos::prepare_open_handler();
     let opts = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 750.0]), ..Default::default() };
-    eframe::run_native("viewr", opts, Box::new(|_cc| Ok(Box::new(viewer) as Box<dyn eframe::App>)))
+    eframe::run_native(
+        "viewr",
+        opts,
+        Box::new(|cc| {
+            // Finder delivers files here (and on later double-clicks) once the
+            // delegate method is installed; anything queued is drained in logic().
+            #[cfg(target_os = "macos")]
+            macos::install_open_handler(&cc.egui_ctx);
+            Ok(Box::new(viewer) as Box<dyn eframe::App>)
+        }),
+    )
+}
+
+/// Whether a positional argument names one image to start on, or a directory to view.
+enum Target {
+    File(PathBuf),
+    Dir(PathBuf),
+}
+
+fn split_target(path: &std::path::Path) -> Target {
+    if path.is_file() { Target::File(path.to_path_buf()) } else { Target::Dir(path.to_path_buf()) }
 }
 
 fn usage() -> &'static str {
-    "usage: viewr [DIR] [--on-key PROG]\n\
+    "usage: viewr [DIR|FILE] [--on-key PROG]\n\
      \n\
      Minimalist native image viewer (JPEG, PNG, Nikon NEF previews).\n\
      \n\
      \x20 DIR            directory of images to view (default: current directory)\n\
+     \x20 FILE           one image to view first, with the images in its directory\n\
      \x20 --on-key PROG  run `PROG <file> <key>` on every handled keypress\n\
      \x20 -h, --help     this help\n\
      \n\
@@ -54,7 +103,7 @@ fn usage() -> &'static str {
 }
 
 struct Args {
-    dir: PathBuf,
+    path: PathBuf,
     on_key: Option<String>,
 }
 
@@ -64,12 +113,15 @@ enum Action {
 }
 
 fn parse_args(argv: Vec<String>) -> Result<Action, String> {
-    let mut dir: Option<PathBuf> = None;
+    let mut path: Option<PathBuf> = None;
     let mut on_key: Option<String> = None;
     let mut i = 0;
     while i < argv.len() {
         let a = argv[i].as_str();
-        if let Some(prog) = a.strip_prefix("--on-key=") {
+        if a.starts_with("-psn_") {
+            // LaunchServices' legacy process-serial-number argument, passed when an
+            // .app is launched from Finder; it is not a path or a flag.
+        } else if let Some(prog) = a.strip_prefix("--on-key=") {
             if prog.is_empty() {
                 return Err("--on-key needs a program".to_string());
             }
@@ -84,15 +136,15 @@ fn parse_args(argv: Vec<String>) -> Result<Action, String> {
             return Ok(Action::Help);
         } else if a.starts_with('-') {
             return Err(format!("unknown flag `{a}`"));
-        } else if dir.is_none() {
-            dir = Some(PathBuf::from(a));
+        } else if path.is_none() {
+            path = Some(PathBuf::from(a));
         } else {
-            return Err("only one directory is accepted".to_string());
+            return Err("only one directory or file is accepted".to_string());
         }
         i += 1;
     }
-    let dir = dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    Ok(Action::Run(Args { dir, on_key }))
+    let path = path.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    Ok(Action::Run(Args { path, on_key }))
 }
 
 enum Slot {
@@ -189,6 +241,39 @@ impl Viewer {
         self.springing = false;
         let at = self.index;
         self.cache.retain(|i, _| i.abs_diff(at) <= 1);
+        self.request_around();
+    }
+
+    /// Show `path`: a directory replaces the current set; a file shows its directory
+    /// with that file first. Used for Finder opens of an already-running viewr.
+    /// Unreadable directories and unsupported files are ignored.
+    fn open_path(&mut self, path: &std::path::Path) {
+        let (dir, file) = match split_target(path) {
+            Target::Dir(dir) => (dir, None),
+            Target::File(file) => {
+                let dir = file.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+                (dir, Some(file))
+            }
+        };
+        let Ok(new_files) = files::collect(&dir) else { return };
+        let index = match &file {
+            Some(f) => match files::index_of(&new_files, f) {
+                Some(i) => i,
+                None => return,
+            },
+            None => 0,
+        };
+        self.files = new_files;
+        self.dir = dir;
+        self.index = index;
+        self.cache.clear();
+        self.loader = loader::Loader::spawn(self.files.clone());
+        self.zoom = 1.0;
+        self.offset = egui::Vec2::ZERO;
+        self.spring_v = 0.0;
+        self.still_frames = 0;
+        self.springing = false;
+        self.last_title = String::new();
         self.request_around();
     }
 
@@ -435,6 +520,12 @@ fn fire_hook(prog: &str, file: &std::path::Path, key: &str) {
 
 impl eframe::App for Viewer {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Files Finder asked us to open (at launch, or while already running).
+        #[cfg(target_os = "macos")]
+        if let Some(path) = macos::take_pending().into_iter().next() {
+            self.open_path(&path);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         self.poll_loader(ctx);
         self.handle_keys(ctx);
         if !self.files.is_empty() && !matches!(self.cache.get(&self.index), Some(Slot::Ready { .. }) | Some(Slot::Failed(_))) {
@@ -496,17 +587,41 @@ mod cli_tests {
     #[test]
     fn parses_positional_and_defaults() {
         let Action::Run(a) = parse_args(args(&[])).unwrap() else { panic!("expected Run") };
-        assert_eq!(a.dir, std::env::current_dir().unwrap());
+        assert_eq!(a.path, std::env::current_dir().unwrap());
         assert!(a.on_key.is_none());
         let Action::Run(a) = parse_args(args(&["pics"])).unwrap() else { panic!("expected Run") };
-        assert_eq!(a.dir, PathBuf::from("pics"));
+        assert_eq!(a.path, PathBuf::from("pics"));
+        // a single image file is a positional too (viewed with its folder alongside)
+        let Action::Run(a) = parse_args(args(&["pics/shot.NEF"])).unwrap() else { panic!("expected Run") };
+        assert_eq!(a.path, PathBuf::from("pics/shot.NEF"));
+    }
+
+    #[test]
+    fn ignores_launchservices_psn_argument() {
+        // Finder launches of a bundled app may carry a legacy -psn_ argument.
+        let Action::Run(a) = parse_args(args(&["-psn_0_123456"])).unwrap() else { panic!("expected Run") };
+        assert_eq!(a.path, std::env::current_dir().unwrap());
+    }
+
+    #[test]
+    fn split_target_distinguishes_file_from_dir() {
+        let dir = std::env::temp_dir().join(format!("viewr-test-target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.jpg");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(matches!(split_target(&file), Target::File(p) if p == file));
+        assert!(matches!(split_target(&dir), Target::Dir(p) if p == dir));
+        // a missing path falls through as a directory, so collect() reports it as before
+        assert!(matches!(split_target(&dir.join("nope")), Target::Dir(_)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn parses_on_key_forms() {
         let Action::Run(a) = parse_args(args(&["--on-key", "hook.sh", "pics"])).unwrap() else { panic!("expected Run") };
         assert_eq!(a.on_key.as_deref(), Some("hook.sh"));
-        assert_eq!(a.dir, PathBuf::from("pics"));
+        assert_eq!(a.path, PathBuf::from("pics"));
         let Action::Run(a) = parse_args(args(&["--on-key=hook.sh"])).unwrap() else { panic!("expected Run") };
         assert_eq!(a.on_key.as_deref(), Some("hook.sh"));
     }
@@ -524,6 +639,24 @@ mod cli_tests {
         assert!(matches!(parse_args(args(&["-h"])).unwrap(), Action::Help));
         assert!(matches!(parse_args(args(&["--help"])).unwrap(), Action::Help));
         assert!(usage().contains("usage: viewr"));
+    }
+}
+
+/// The macOS bundle (built by scripts/make-app.sh) is what Finder uses to offer
+/// viewr for a file: its document types must cover every extension the viewer
+/// itself opens, or some supported files will not open from Finder.
+#[cfg(test)]
+mod bundle_tests {
+    #[test]
+    fn info_plist_registers_every_supported_extension() {
+        let plist = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/packaging/Info.plist")).unwrap();
+        assert!(plist.contains("<key>CFBundleDocumentTypes</key>"), "no document types registered");
+        assert!(plist.contains("<string>app.viewr.viewr</string>"), "bundle identifier missing");
+        assert!(plist.contains("<string>viewr</string>"), "executable name missing");
+        for ext in ["jpg", "jpeg", "png", "nef"] {
+            assert!(plist.contains(&format!("<string>{ext}</string>")), "Finder registration misses .{ext}");
+            assert!(crate::files::is_supported(std::path::Path::new(&format!("x.{ext}"))), "viewer rejects .{ext}");
+        }
     }
 }
 
@@ -923,6 +1056,33 @@ mod state_tests {
         .clear();
         assert_eq!(v.offset, egui::Vec2::ZERO, "zoom scrolling must not pan");
         assert!(v.zoom > 1.0, "zoom = {}", v.zoom);
+    }
+
+    #[test]
+    fn open_path_switches_folder_and_starts_on_the_file() {
+        let (dir_a, files_a) = fixture_dir("open-a", &[(8, 8), (8, 8)]);
+        let (dir_b, files_b) = fixture_dir("open-b", &[(8, 8), (8, 8), (8, 8)]);
+        let mut v = Viewer::new(files_a, dir_a.clone(), None);
+        // a Finder-style open of the second image in another folder
+        v.zoom = 3.0;
+        v.open_path(&files_b[1]);
+        assert_eq!(v.dir, dir_b);
+        assert_eq!(v.files, files_b);
+        assert_eq!(v.index, 1);
+        assert_eq!(v.zoom, 1.0, "switching images resets zoom");
+        // opening a file in the same folder just jumps to it
+        v.open_path(&files_b[2]);
+        assert_eq!(v.index, 2);
+        // opening a folder shows it from the top
+        v.open_path(&dir_a);
+        assert_eq!(v.dir, dir_a);
+        assert_eq!(v.index, 0);
+        // unsupported or missing paths leave the viewer alone
+        std::fs::write(dir_a.join("notes.txt"), b"x").unwrap();
+        let before = (v.dir.clone(), v.files.clone(), v.index);
+        v.open_path(&dir_a.join("notes.txt"));
+        v.open_path(&dir_a.join("missing.jpg"));
+        assert_eq!((v.dir.clone(), v.files.clone(), v.index), before);
     }
 
     #[test]
